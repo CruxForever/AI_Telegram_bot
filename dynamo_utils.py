@@ -152,7 +152,30 @@ def update_user_names(
             ExpressionAttributeNames=expr_names if expr_names else None,
         )
     except Exception as e:
-        logger.warning(f"update_user_names({user_id}) failed: {e}")
+        if "document path provided in the update expression is invalid" in str(e):
+            # profile атрибута нет — инициализируем и повторяем
+            try:
+                users_tbl.update_item(
+                    Key={"user_id": user_id},
+                    UpdateExpression="SET #p = if_not_exists(#p, :empty)",
+                    ExpressionAttributeNames={"#p": "profile"},
+                    ExpressionAttributeValues={":empty": {
+                        "first_name": "", "last_name": "",
+                        "communication_style": "", "interests": [],
+                        "long_term_summary": "", "last_topics": [],
+                        "message_count": 0,
+                    }},
+                )
+                users_tbl.update_item(
+                    Key={"user_id": user_id},
+                    UpdateExpression="SET " + ", ".join(update_expr_parts),
+                    ExpressionAttributeValues=expr_vals,
+                    ExpressionAttributeNames=expr_names if expr_names else None,
+                )
+            except Exception as e2:
+                logger.warning(f"update_user_names({user_id}) retry failed: {e2}")
+        else:
+            logger.warning(f"update_user_names({user_id}) failed: {e}")
 
 def update_user_profile(
     user_id: str,
@@ -199,7 +222,30 @@ def update_user_profile(
             ExpressionAttributeNames=expr_names,
         )
     except Exception as e:
-        logger.warning(f"update_user_profile({user_id}) failed: {e}")
+        if "document path provided in the update expression is invalid" in str(e):
+            # profile атрибута нет (старый пользователь) — инициализируем и повторяем
+            try:
+                users_tbl.update_item(
+                    Key={"user_id": user_id},
+                    UpdateExpression="SET #p = if_not_exists(#p, :empty)",
+                    ExpressionAttributeNames={"#p": "profile"},
+                    ExpressionAttributeValues={":empty": {
+                        "first_name": "", "last_name": "",
+                        "communication_style": "", "interests": [],
+                        "long_term_summary": "", "last_topics": [],
+                        "message_count": 0,
+                    }},
+                )
+                users_tbl.update_item(
+                    Key={"user_id": user_id},
+                    UpdateExpression="SET " + ", ".join(update_expr_parts),
+                    ExpressionAttributeValues=expr_vals,
+                    ExpressionAttributeNames=expr_names,
+                )
+            except Exception as e2:
+                logger.warning(f"update_user_profile({user_id}) retry failed: {e2}")
+        else:
+            logger.warning(f"update_user_profile({user_id}) failed: {e}")
 
 def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
     """Возвращает профиль пользователя или None."""

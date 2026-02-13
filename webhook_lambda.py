@@ -14,7 +14,7 @@ SQS_IS_FIFO = os.getenv("SQS_IS_FIFO", "0") == "1"
 sqs = boto3.client("sqs")
 
 def _parse_for_keys(update: Dict[str, Any]) -> Dict[str, Any]:
-    msg = (update or {}).get("message") or (update or {}).get("channel_post") or {}
+    msg = (update or {}).get("message") or (update or {}).get("edited_message") or (update or {}).get("channel_post") or {}
     chat = msg.get("chat", {}) or {}
     chat_id = chat.get("id")
     chat_type = chat.get("type")
@@ -51,17 +51,17 @@ def lambda_handler(event, context):
         return {"statusCode": 500, "body": "SQS not configured"}
 
     keys = _parse_for_keys(update)
+    # SQS не принимает атрибуты с пустым значением — добавляем только непустые
+    msg_attrs = {
+        k: {"DataType": "String", "StringValue": v}
+        for k, v in keys.items()
+        if v
+    }
+
     params = {
         "QueueUrl": SQS_QUEUE_URL,
         "MessageBody": json.dumps(update, ensure_ascii=False),
-        "MessageAttributes": {
-            "dialog_key": {"DataType": "String", "StringValue": keys["dialog_key"]},
-            "chat_type":  {"DataType": "String", "StringValue": keys["chat_type"]},
-            "chat_id":    {"DataType": "String", "StringValue": keys["chat_id"]},
-            "thread_id":  {"DataType": "String", "StringValue": keys["thread_id"]},
-            "user_id":    {"DataType": "String", "StringValue": keys["user_id"]},
-            "update_id":  {"DataType": "String", "StringValue": keys["update_id"]},
-        },
+        "MessageAttributes": msg_attrs,
     }
     if SQS_IS_FIFO:
         params["MessageGroupId"] = keys["dialog_key"] or (keys["chat_id"] or "default")

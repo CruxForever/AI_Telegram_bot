@@ -68,7 +68,9 @@ def _ensure_alternation(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _chat(messages: List[Dict[str, Any]], system: str,
-          temperature: float, max_tokens: int) -> str:
+          temperature: float, max_tokens: int,
+          tools: Optional[List[Dict[str, Any]]] = None,
+          tool_executor=None) -> str:
     if _client is None:
         logger.error("Anthropic client is not configured")
         return "⚠️ Anthropic client is not configured."
@@ -88,8 +90,36 @@ def _chat(messages: List[Dict[str, Any]], system: str,
         }
         if system:
             kwargs["system"] = system
+        if tools:
+            kwargs["tools"] = tools
 
-        resp = _client.messages.create(**kwargs)
+        # Цикл tool use: Claude может вызвать инструмент несколько раз
+        while True:
+            resp = _client.messages.create(**kwargs)
+
+            if resp.stop_reason != "tool_use" or not tool_executor:
+                break  # обычный ответ — выходим
+
+            # Claude запросил вызов инструмента — выполняем и передаём результат
+            tool_results = []
+            for block in resp.content:
+                if block.type == "tool_use":
+                    try:
+                        result = tool_executor(block.name, block.input)
+                    except Exception as e:
+                        result = f"Ошибка инструмента: {e}"
+                    logger.info("Tool call: %s(%s) -> %s", block.name, block.input, result[:100])
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(result),
+                    })
+
+            # Добавляем ответ ассистента + результаты инструментов и делаем следующий запрос
+            kwargs["messages"] = kwargs["messages"] + [
+                {"role": "assistant", "content": resp.content},
+                {"role": "user", "content": tool_results},
+            ]
 
         # Извлекаем текст из content-блоков
         text_parts = []
@@ -106,9 +136,15 @@ def _chat(messages: List[Dict[str, Any]], system: str,
 def generate_response(messages: List[Dict[str, Any]], *,
                       system: str = "",
                       temperature: float = 0.5,
-                      max_tokens: int = 800) -> str:
-    """Генерация ответа Claude. messages — только user/assistant."""
-    return _chat(messages, system, temperature, max_tokens)
+                      max_tokens: int = 800,
+                      tools: Optional[List[Dict[str, Any]]] = None,
+                      tool_executor=None) -> str:
+    """Генерация ответа Claude. messages — только user/assistant.
+    tools — список инструментов для tool use (опционально).
+    tool_executor — callable(tool_name, tool_input) -> str (опционально).
+    """
+    return _chat(messages, system, temperature, max_tokens,
+                 tools=tools, tool_executor=tool_executor)
 
 
 def summarize_history(

@@ -1,4 +1,5 @@
 
+import datetime
 import json
 import logging
 import os
@@ -35,6 +36,62 @@ BASE_SYSTEM_PROMPT     = os.getenv("BASE_SYSTEM_PROMPT", "").strip()
 BOT_USERNAME = (os.getenv("BOT_USERNAME") or "").lstrip("@").lower()
 BOT_ID = int(os.getenv("BOT_ID", "0")) or None
 GROUP_SCOPE_DEFAULT = os.getenv("GROUP_SCOPE_DEFAULT", "hybrid").lower()
+
+OPENWEATHERMAP_API_KEY = os.getenv("OPENWEATHERMAP_API_KEY", "")
+WEATHER_DEFAULT_CITY   = os.getenv("WEATHER_DEFAULT_CITY", "Moscow")
+
+# ---- Weather tool ----
+
+def _fetch_weather(city: str) -> str:
+    """Запрашивает текущую погоду через OpenWeatherMap API."""
+    if not OPENWEATHERMAP_API_KEY:
+        return "Погода недоступна: не настроен OPENWEATHERMAP_API_KEY"
+    try:
+        import requests
+        url = (
+            f"https://api.openweathermap.org/data/2.5/weather"
+            f"?q={city}&appid={OPENWEATHERMAP_API_KEY}&units=metric&lang=ru"
+        )
+        r = requests.get(url, timeout=5)
+        d = r.json()
+        if r.status_code == 200:
+            return (
+                f"Погода в {d['name']}: {d['weather'][0]['description']}, "
+                f"{d['main']['temp']:.0f}°C (ощущается {d['main']['feels_like']:.0f}°C), "
+                f"влажность {d['main']['humidity']}%, ветер {d['wind']['speed']} м/с"
+            )
+        elif r.status_code == 404:
+            return f"Город '{city}' не найден. Уточни название."
+        else:
+            return f"Ошибка погоды: {d.get('message', r.status_code)}"
+    except Exception as e:
+        logger.warning("Weather fetch failed: %s", e)
+        return f"Не удалось получить погоду: {e}"
+
+
+WEATHER_TOOL = {
+    "name": "get_weather",
+    "description": "Получить текущую погоду в указанном городе",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "city": {
+                "type": "string",
+                "description": "Название города (например: Moscow, Москва, London, Санкт-Петербург)",
+            }
+        },
+        "required": ["city"],
+    },
+}
+
+
+def _tool_executor(tool_name: str, tool_input: Dict[str, Any]) -> str:
+    """Роутер вызовов инструментов от Claude."""
+    if tool_name == "get_weather":
+        city = tool_input.get("city") or WEATHER_DEFAULT_CITY
+        return _fetch_weather(city)
+    return f"Неизвестный инструмент: {tool_name}"
+
 
 def dialog_key_for(chat_type: Optional[str], chat_id: int, user_id: Optional[int], thread_id: Optional[int]) -> str:
     if chat_type == "private" and user_id:
@@ -132,7 +189,7 @@ def split_telegram(text: str, limit: int = 4000):
 
 def _parse_update(raw: str) -> Dict[str, Any]:
     update = json.loads(raw)
-    msg = (update or {}).get("message") or (update or {}).get("channel_post") or {}
+    msg = (update or {}).get("message") or (update or {}).get("edited_message") or (update or {}).get("channel_post") or {}
     chat = msg.get("chat", {}) or {}
     chat_id = chat.get("id")
     chat_type = chat.get("type")
@@ -273,6 +330,10 @@ def _process_one(update_raw: str) -> str:
         logger.warning("STEP4 gate failed (continue anyway): %s", e)
 
     system_parts = []
+    # Текущая дата и время МСК — модель не знает их без явной передачи
+    _tz_msk = datetime.timezone(datetime.timedelta(hours=3))
+    _now = datetime.datetime.now(_tz_msk)
+    system_parts.append(f"Текущая дата и время: {_now.strftime('%d.%m.%Y %H:%M')} (МСК)")
     if BASE_SYSTEM_PROMPT:
         system_parts.append(BASE_SYSTEM_PROMPT)
     try:
@@ -489,7 +550,14 @@ def _process_one(update_raw: str) -> str:
     messages = _view(chat_msgs)
     logger.info("STEP5 messages_ready=%d tokens~%d", len(messages), total_tokens())
 
-    ai_resp = generate_response(messages, system=system_prompt, max_tokens=MAX_OUTPUT_TOKENS)
+    _active_tools = [WEATHER_TOOL] if OPENWEATHERMAP_API_KEY else []
+    ai_resp = generate_response(
+        messages,
+        system=system_prompt,
+        max_tokens=MAX_OUTPUT_TOKENS,
+        tools=_active_tools or None,
+        tool_executor=_tool_executor if _active_tools else None,
+    )
     if (ai_resp or "").strip().lower() in {"assistant","system","user",""}:
         logger.warning("STEP6 non-text placeholder from model: %r", ai_resp)
         ai_resp = "⚠️ Пустой ответ модели. Зафиксировал это в логах."

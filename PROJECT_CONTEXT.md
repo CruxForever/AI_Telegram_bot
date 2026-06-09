@@ -1,0 +1,247 @@
+# Контекст проекта AI Petrovich
+
+> **Для AI ассистента**: Прочитай этот файл перед началом работы с проектом
+
+## 🎯 Назначение проекта
+
+Персонализированный Telegram-бот на Claude API с долгосрочной памятью о пользователях. Асинхронная архитектура через AWS Lambda + SQS для масштабируемости.
+
+## 🏗️ Архитектура
+
+```
+Telegram → webhook_lambda → SQS → worker_lambda → Claude API → Telegram
+                                       ↓
+                                   DynamoDB
+```
+
+### Ключевые компоненты:
+
+1. **webhook_lambda.py** (77 строк)
+   - Принимает webhook от Telegram
+   - Парсит update, извлекает ключевые поля
+   - Отправляет в SQS для асинхронной обработки
+   - Поддерживает FIFO очереди с дедупликацией
+
+2. **worker_lambda.py** (570+ строк) - **ОСНОВНОЙ ФАЙЛ**
+   - Обрабатывает сообщения из SQS
+   - Формирует персонализированный контекст для модели
+   - Управляет диалогами, саммаризацией, профилями
+   - Реализует режимы работы (always/mention/off)
+   - Поддерживает scope в группах (initiator/thread/hybrid)
+
+3. **claude_utils.py** (220+ строк)
+   - Интеграция с Anthropic Claude API
+   - **generate_response()** - поддерживает `tools` и `tool_executor` для Tool Use
+   - **_chat()** - цикл tool use (вызывает инструменты пока `stop_reason == "tool_use"`)
+   - **summarize_history()** - краткие сводки (30 msg, 600 tokens)
+   - **create_long_term_summary()** - долгосрочные профили (60 msg, 400 tokens)
+   - **extract_topics()** - извлечение тем (10 msg, 100 tokens)
+
+4. **dynamo_utils.py** (234 строки)
+   - CRUD операции для всех таблиц DynamoDB
+   - **save_user()** - создание с profile структурой
+   - **update_user_names()** - обновление имён
+   - **update_user_profile()** - обновление долгосрочной памяти
+   - **get_user_profile()** - получение профиля
+
+5. **telegram_utils.py** (79 строк)
+   - Отправка сообщений через Telegram Bot API
+   - Поддержка тредов, каналов, reply
+   - send_chat_action для индикации "печатает..."
+
+## 📊 Структуры данных DynamoDB
+
+### Users (PK: user_id)
+```python
+{
+    "user_id": "123456789",
+    "username": "ivan_petrov",
+    "profile": {
+        "first_name": "Иван",
+        "last_name": "Петров",
+        "communication_style": "Технический, прямой",
+        "interests": ["Python", "AWS Lambda"],
+        "long_term_summary": "Разрабатывает телеграм-бота...",
+        "last_topics": ["Lambda Layer", "Docker"],
+        "message_count": 156
+    },
+    "created_at": "2025-01-15T10:30:00Z",
+    "updated_at": "2025-01-20T14:25:00Z"
+}
+```
+
+### Messages (PK: dialog_key, SK: timestamp)
+```python
+{
+    "dialog_key": "123456789",  # user_id для private, chat_id для групп
+    "timestamp": 1705317000000,  # milliseconds
+    "role": "user",  # или "assistant"
+    "content": "Текст сообщения",
+    "from_user": "123456789",
+    "from_username": "ivan_petrov",
+    "to_user": "",
+    "created_at": "2025-01-15T10:30:00Z",
+    "expire_at": 1736853000  # TTL 1 год
+}
+```
+
+### Settings (PK: dialog_key)
+```python
+{
+    "dialog_key": "123456789",
+    "mode": "always",  # always | mention | off
+    "meta": {
+        "group_scope": "hybrid"  # initiator | thread | hybrid
+    },
+    "created_at": "2025-01-15T10:30:00Z",
+    "updated_at": "2025-01-20T14:25:00Z"
+}
+```
+
+## 🔄 Основные workflow
+
+### Обработка сообщения (worker_lambda.py: _process_one)
+
+1. **Парсинг** (строки 128-157) - извлечение first_name, last_name, username
+2. **Создание/обновление сущностей** (180-190) - Users/Channels/Threads
+3. **Сохранение сообщения** (192-205) - в Messages таблицу
+4. **Проверка режима** (265-273) - should_respond_by_mode()
+5. **Формирование контекста** (275-408):
+   - System prompt с BASE_SYSTEM_PROMPT
+   - Профиль пользователя (для private)
+   - Карта участников (для групп)
+   - История сообщений с обогащёнными префиксами
+6. **Trim контекста** (444-476) - до MAX_CONTEXT_TOKENS
+7. **Генерация ответа** (492) - через Claude API
+8. **Отправка в Telegram** (502-507)
+9. **Обновление профилей** (509-551):
+   - Счётчик сообщений
+   - Краткая саммаризация (каждые 12 msg)
+   - Долгосрочный профиль (каждые 50 msg)
+
+### Персонализация контекста
+
+**Приватный чат** (worker_lambda.py:287-320):
+```
+О собеседнике (Иван @ivan_petrov):
+- Стиль общения: Технический, прямой
+- Интересы: Python, AWS Lambda
+- Контекст прошлых бесед: ...
+- Последние темы: Docker, DynamoDB
+```
+
+**Групповой чат** (worker_lambda.py:354-408):
+```
+Участники беседы:
+- Иван (@ivan_petrov), ID:123456 — текущий автор запроса
+- Мария (@maria_dev), ID:789012 — участник
+```
+
+**Префиксы сообщений** (worker_lambda.py:410-440):
+- Было: `[user:123456] Текст`
+- Стало: `[Иван (@ivan_petrov), ID:123456] Текст`
+
+## 🔑 Ключевые функции
+
+### worker_lambda.py
+- `dialog_key_for()` - формирование ключа диалога
+- `detect_mention()` - определение упоминания бота
+- `should_respond_by_mode()` - логика режимов ответа
+- `get_cached_profile()` - кеширование профилей (внутри _process_one)
+- `_parse_update()` - парсинг Telegram update
+- `_process_one()` - **ГЛАВНАЯ ФУНКЦИЯ** обработки сообщения
+
+### claude_utils.py
+- `summarize_history()` - улучшенная саммаризация с контекстом
+- `create_long_term_summary()` - создание профиля пользователя
+- `extract_topics()` - извлечение ключевых тем
+
+### dynamo_utils.py
+- `save_user()` - создание пользователя с profile
+- `update_user_names()` - обновление имён при изменении
+- `update_user_profile()` - обновление долгосрочной памяти
+- `get_user_profile()` - получение профиля
+
+## ⚙️ Переменные окружения
+
+**Обязательные:**
+- `ANTHROPIC_API_KEY` - ключ Claude API
+- `TELEGRAM_TOKEN` - токен бота
+- `BOT_USERNAME` - username без @
+- `BOT_ID` - ID бота
+
+**Таблицы DynamoDB:**
+- `USERS_TABLE` (default: Users)
+- `MESSAGES_TABLE` (default: Messages)
+- `SUMMARIES_TABLE` (default: Summaries)
+- `SETTINGS_TABLE` (default: Settings)
+- `CHANNELS_TABLE` (default: Channels)
+- `THREADS_TABLE` (default: Threads)
+
+**Настройки модели:**
+- `CLAUDE_MODEL` (default: claude-sonnet-4-5-20250929)
+- `MAX_CONTEXT_TOKENS` (default: 6000)
+- `MAX_OUTPUT_TOKENS` (default: 800)
+- `MIN_MSGS_FOR_SUMMARY` (default: 12)
+- `SUMMARY_HISTORY_LIMIT` (default: 60)
+
+**Погода и дата:**
+- `OPENWEATHERMAP_API_KEY` - ключ OpenWeatherMap API (бесплатный)
+- `WEATHER_DEFAULT_CITY` (default: Moscow) - город по умолчанию если не указан в сообщении
+
+**Опциональные:**
+- `BASE_SYSTEM_PROMPT` - базовый промпт для модели (обновлять через Python/boto3, не через AWS CLI — проблемы с кодировкой)
+- `GROUP_SCOPE_DEFAULT` (default: hybrid)
+
+## 🐛 Известные особенности
+
+1. **Саммаризация без контекста** - вызывается без user_context (можно улучшить)
+2. **Нет retry для Claude API** - при ошибке сообщение может потеряться
+3. **Последовательная обработка SQS** - можно распараллелить через ThreadPoolExecutor
+4. **Только текущая погода** - прогноз на завтра/послезавтра не реализован (нужен другой endpoint OpenWeatherMap)
+
+## 📚 Зависимости (requirements.txt)
+
+```
+anthropic>=0.40.0  # Claude API
+requests>=2.31.0   # Telegram API
+boto3>=1.34.0      # AWS SDK (DynamoDB, SQS)
+```
+
+## 🚀 Деплой
+
+1. Собрать Lambda Layer: `build_layer.bat`
+2. Создать таблицы DynamoDB (см. README.md)
+3. Создать SQS FIFO очередь
+4. Развернуть Lambda функции
+5. Настроить Telegram webhook
+
+## 💡 Tips для работы с проектом
+
+1. **Читай сначала этот файл** - экономит время на изучение кода
+2. **Основная логика в worker_lambda.py** - начинай с функции `_process_one()`
+3. **Профили в DynamoDB** - структура определена в `save_user()` (dynamo_utils.py:50-58)
+4. **Контекст формируется в** - строки 275-408 worker_lambda.py
+5. **При изменении структуры profile** - обнови и эту документацию
+
+## 📝 Последние изменения
+
+**2026-02-13: Tool Use, погода, деплой**
+- Дата/время МСК в каждом запросе к модели
+- Погода через OpenWeatherMap (Claude Tool Use)
+- Обработка edited_message
+- Исправлен баг с пустыми SQS атрибутами
+- Исправлена миграция профилей старых пользователей DynamoDB
+- Деплой через AWS CLI + Python/boto3
+
+**2025-01-20: Добавлена персонализация**
+- Извлечение first_name/last_name из Telegram
+- Структура profile с долгосрочной памятью
+- Улучшенная саммаризация (30 msg, 600 tokens)
+- Карта участников в групповых чатах
+- Обогащённые префиксы с именами
+
+**2025-01-15: Initial release**
+- Базовая асинхронная архитектура
+- Интеграция с Claude API
+- Поддержка групп и тредов

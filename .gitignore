@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Lambda build artifacts
+*.zip
+python/
+слой/python/
+build/
+
+# Secrets / local env
+.env
+.env.*
+*.pem
+secrets.json
+aws-credentials*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.code-workspace
+.idea/
+.vscode/

@@ -35,14 +35,40 @@ _init_client()
 # Claude не имеет публичного локального токенизатора (как tiktoken у OpenAI).
 # Используем приближение ~4 символа = 1 токен (аналогично fallback в старом коде).
 
+def _content_len(content: Any) -> int:
+    """Длина контента в символах. Поддерживает как строку, так и список блоков
+    (мультимодальное сообщение: text/image)."""
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            btype = b.get("type")
+            if btype == "text":
+                total += len(b.get("text", ""))
+            elif btype == "image":
+                total += 6400  # ~1600 токенов на изображение (грубая оценка)
+        return total
+    return 0
+
+
 def num_tokens_from_messages(messages: List[Dict[str, Any]], system: str = "") -> int:
     """Approximate token count for system prompt + messages."""
     tokens = len(system) // 4 + 4          # system overhead
     for m in messages:
         tokens += 4                         # per-message overhead
-        tokens += len(m.get("content", "")) // 4
+        tokens += _content_len(m.get("content", "")) // 4
     tokens += 2                             # conversation overhead
     return tokens
+
+
+def _to_blocks(content: Any) -> List[Dict[str, Any]]:
+    """Приводит контент к списку блоков (для склейки мультимодальных сообщений)."""
+    if isinstance(content, list):
+        return list(content)
+    return [{"type": "text", "text": content if isinstance(content, str) else str(content)}]
 
 
 def _ensure_alternation(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -50,6 +76,7 @@ def _ensure_alternation(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     Claude API требует строгое чередование user/assistant.
     Склеиваем подряд идущие сообщения одной роли.
     Гарантируем, что первое сообщение — user.
+    Корректно работает и с мультимодальным контентом (список блоков).
     """
     if not messages:
         return []
@@ -58,13 +85,35 @@ def _ensure_alternation(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         role = m.get("role", "user")
         content = m.get("content", "")
         if merged and merged[-1]["role"] == role:
-            merged[-1]["content"] += "\n" + content
+            prev = merged[-1]["content"]
+            if isinstance(prev, list) or isinstance(content, list):
+                merged[-1]["content"] = _to_blocks(prev) + _to_blocks(content)
+            else:
+                merged[-1]["content"] = prev + "\n" + content
         else:
             merged.append({"role": role, "content": content})
     # Claude требует, чтобы первое сообщение было user
     if merged and merged[0]["role"] != "user":
         merged.insert(0, {"role": "user", "content": "(начало диалога)"})
     return merged
+
+
+def _client_tools_only(tools: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+    """Оставляет только клиентские инструменты (без серверных, у которых есть поле "type",
+    напр. web_search_20250305). Используется для graceful-degradation при ошибке."""
+    if not tools:
+        return None
+    client_only = [t for t in tools if "type" not in t]
+    return client_only or None
+
+
+def _extract_text(resp) -> str:
+    """Достаёт текстовые блоки из ответа Claude (игнорируя tool_use/web_search блоки)."""
+    text_parts = []
+    for block in getattr(resp, "content", []) or []:
+        if getattr(block, "type", None) == "text" and hasattr(block, "text"):
+            text_parts.append(block.text)
+    return "\n".join(text_parts).strip()
 
 
 def _chat(messages: List[Dict[str, Any]], system: str,
@@ -81,26 +130,33 @@ def _chat(messages: List[Dict[str, Any]], system: str,
     if not safe_messages:
         safe_messages = [{"role": "user", "content": "(пустой контекст)"}]
 
-    try:
+    def _run(active_tools: Optional[List[Dict[str, Any]]]):
         kwargs: Dict[str, Any] = {
             "model": model,
             "max_tokens": max_tokens,
-            "messages": safe_messages,
+            "messages": list(safe_messages),
             "temperature": temperature,
         }
         if system:
             kwargs["system"] = system
-        if tools:
-            kwargs["tools"] = tools
+        if active_tools:
+            kwargs["tools"] = active_tools
 
-        # Цикл tool use: Claude может вызвать инструмент несколько раз
-        while True:
+        # Цикл tool use: Claude может вызвать клиентский инструмент несколько раз.
+        # Серверные инструменты (web_search) выполняются на стороне API.
+        for _ in range(8):  # защита от зацикливания
             resp = _client.messages.create(**kwargs)
 
-            if resp.stop_reason != "tool_use" or not tool_executor:
-                break  # обычный ответ — выходим
+            # Долгий серверный инструмент мог приостановить ход — продолжаем
+            if resp.stop_reason == "pause_turn":
+                kwargs["messages"] = kwargs["messages"] + [
+                    {"role": "assistant", "content": resp.content},
+                ]
+                continue
 
-            # Claude запросил вызов инструмента — выполняем и передаём результат
+            if resp.stop_reason != "tool_use" or not tool_executor:
+                return resp
+
             tool_results = []
             for block in resp.content:
                 if block.type == "tool_use":
@@ -108,29 +164,41 @@ def _chat(messages: List[Dict[str, Any]], system: str,
                         result = tool_executor(block.name, block.input)
                     except Exception as e:
                         result = f"Ошибка инструмента: {e}"
-                    logger.info("Tool call: %s(%s) -> %s", block.name, block.input, result[:100])
+                    logger.info("Tool call: %s(%s) -> %s", block.name, block.input, str(result)[:100])
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
                         "content": str(result),
                     })
 
-            # Добавляем ответ ассистента + результаты инструментов и делаем следующий запрос
             kwargs["messages"] = kwargs["messages"] + [
                 {"role": "assistant", "content": resp.content},
                 {"role": "user", "content": tool_results},
             ]
 
-        # Извлекаем текст из content-блоков
-        text_parts = []
-        for block in resp.content:
-            if hasattr(block, "text"):
-                text_parts.append(block.text)
-        return "\n".join(text_parts).strip() if text_parts else ""
+        return resp  # исчерпали лимит итераций — возвращаем последний ответ
 
+    # Основная попытка → деградация: при ошибке убираем серверные инструменты,
+    # затем все инструменты, чтобы пользователь всё равно получил ответ.
+    try:
+        resp = _run(tools)
     except Exception as e:
-        logger.exception("Anthropic API error: %r", e)
-        return "⚠️ Не удалось получить ответ от модели."
+        logger.exception("Anthropic API error (tools=%s): %r", bool(tools), e)
+        if tools:
+            try:
+                logger.warning("Retry with client-only tools")
+                resp = _run(_client_tools_only(tools))
+            except Exception as e2:
+                logger.warning("Retry client-only failed: %r; retry with no tools", e2)
+                try:
+                    resp = _run(None)
+                except Exception as e3:
+                    logger.exception("Anthropic API final error: %r", e3)
+                    return "⚠️ Не удалось получить ответ от модели."
+        else:
+            return "⚠️ Не удалось получить ответ от модели."
+
+    return _extract_text(resp)
 
 
 def generate_response(messages: List[Dict[str, Any]], *,
@@ -145,6 +213,21 @@ def generate_response(messages: List[Dict[str, Any]], *,
     """
     return _chat(messages, system, temperature, max_tokens,
                  tools=tools, tool_executor=tool_executor)
+
+
+def _plain_text(content: Any) -> str:
+    """Текстовое представление контента для саммаризации (отбрасывает изображения)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text", ""))
+            elif isinstance(b, dict) and b.get("type") == "image":
+                parts.append("[изображение]")
+        return " ".join(parts)
+    return str(content)
 
 
 def summarize_history(
@@ -166,7 +249,7 @@ def summarize_history(
 Формат: 2-4 абзаца, фокус на смысле и контексте личностей, а не на мелких деталях."""
 
     # Увеличить количество сообщений и токенов
-    few = [{"role": m["role"], "content": m["content"]} for m in history[-30:]]
+    few = [{"role": m["role"], "content": _plain_text(m.get("content", ""))} for m in history[-30:]]
 
     # Если есть контекст пользователя, добавить в system
     if user_context:
@@ -197,7 +280,7 @@ def create_long_term_summary(
 Формат: 1-2 абзаца, краткий профиль собеседника."""
 
     # Берем последние 60 сообщений для анализа
-    messages = [{"role": m["role"], "content": m["content"]} for m in history[-60:]]
+    messages = [{"role": m["role"], "content": _plain_text(m.get("content", ""))} for m in history[-60:]]
 
     # Добавить имя пользователя в контекст
     if user_info.get("first_name"):
@@ -214,7 +297,7 @@ def extract_topics(messages: List[Dict[str, Any]], max_topics: int = 5) -> List[
 Верни ТОЛЬКО список тем через запятую, без нумерации и пояснений.
 Пример: Python, AWS Lambda, DynamoDB, Claude API, Телеграм боты"""
 
-    few = [{"role": m["role"], "content": m["content"]} for m in messages[-10:]]
+    few = [{"role": m["role"], "content": _plain_text(m.get("content", ""))} for m in messages[-10:]]
 
     try:
         result = _chat(few, system, temperature=0.2, max_tokens=100)

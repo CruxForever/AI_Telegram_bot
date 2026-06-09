@@ -254,6 +254,113 @@ def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
         return user.get("profile", {})
     return None
 
+# ---------- Долговременная память (явные факты) ----------
+
+_EMPTY_PROFILE = {
+    "first_name": "", "last_name": "",
+    "communication_style": "", "interests": [],
+    "long_term_summary": "", "last_topics": [],
+    "facts": [], "message_count": 0,
+}
+
+
+def _init_profile_if_missing(user_id: str) -> None:
+    """Инициализирует map `profile` у старого пользователя (если его нет)."""
+    try:
+        users_tbl.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression="SET #p = if_not_exists(#p, :empty)",
+            ExpressionAttributeNames={"#p": "profile"},
+            ExpressionAttributeValues={":empty": dict(_EMPTY_PROFILE)},
+        )
+    except Exception as e:
+        logger.warning(f"_init_profile_if_missing({user_id}) failed: {e}")
+
+
+def get_user_facts(user_id: str) -> List[str]:
+    """Список явно сохранённых фактов о пользователе."""
+    prof = get_user_profile(user_id) or {}
+    facts = prof.get("facts") or []
+    return [str(f).strip() for f in facts if str(f).strip()]
+
+
+def add_user_fact(user_id: str, fact: str) -> bool:
+    """Добавляет факт в долговременную память пользователя (с дедупликацией)."""
+    fact = (fact or "").strip()
+    if not fact:
+        return False
+    existing = get_user_facts(user_id)
+    if any(fact.lower() == e.lower() for e in existing):
+        return True  # уже есть — считаем успехом
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def _do():
+        users_tbl.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression=(
+                "SET #p.#f = list_append(if_not_exists(#p.#f, :empty), :new), updated_at = :u"
+            ),
+            ExpressionAttributeNames={"#p": "profile", "#f": "facts"},
+            ExpressionAttributeValues={":empty": [], ":new": [fact], ":u": now},
+        )
+
+    try:
+        _do()
+        return True
+    except Exception as e:
+        if "document path provided in the update expression is invalid" in str(e):
+            _init_profile_if_missing(user_id)
+            try:
+                _do()
+                return True
+            except Exception as e2:
+                logger.warning(f"add_user_fact({user_id}) retry failed: {e2}")
+                return False
+        logger.warning(f"add_user_fact({user_id}) failed: {e}")
+        return False
+
+
+def remove_user_facts(user_id: str, query: Optional[str] = None) -> int:
+    """Удаляет факты, подходящие под `query` (подстрока, регистронезависимо).
+    Если query пустой — очищает все факты. Возвращает число удалённых."""
+    facts = get_user_facts(user_id)
+    if not facts:
+        return 0
+    if not query or not query.strip():
+        kept: List[str] = []
+        removed = len(facts)
+    else:
+        q = query.strip().lower()
+        kept = [f for f in facts if q not in f.lower()]
+        removed = len(facts) - len(kept)
+    if removed == 0:
+        return 0
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        users_tbl.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression="SET #p.#f = :k, updated_at = :u",
+            ExpressionAttributeNames={"#p": "profile", "#f": "facts"},
+            ExpressionAttributeValues={":k": kept, ":u": now},
+        )
+        return removed
+    except Exception as e:
+        if "document path provided in the update expression is invalid" in str(e):
+            _init_profile_if_missing(user_id)
+            try:
+                users_tbl.update_item(
+                    Key={"user_id": user_id},
+                    UpdateExpression="SET #p.#f = :k, updated_at = :u",
+                    ExpressionAttributeNames={"#p": "profile", "#f": "facts"},
+                    ExpressionAttributeValues={":k": kept, ":u": now},
+                )
+                return removed
+            except Exception as e2:
+                logger.warning(f"remove_user_facts({user_id}) retry failed: {e2}")
+                return 0
+        logger.warning(f"remove_user_facts({user_id}) failed: {e}")
+        return 0
+
 # ---------- Messages / Summaries ----------
 
 def save_message(

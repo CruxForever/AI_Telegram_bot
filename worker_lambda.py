@@ -15,6 +15,7 @@ from dynamo_utils import (
     update_user_names,
     update_user_profile,
     get_user_profile,
+    get_user_facts, add_user_fact, remove_user_facts,
 )
 from claude_utils import (
     num_tokens_from_messages,
@@ -23,7 +24,7 @@ from claude_utils import (
     create_long_term_summary,
     extract_topics,
 )
-from telegram_utils import send_message, send_chat_action
+from telegram_utils import send_message, send_chat_action, get_file_base64
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -39,6 +40,13 @@ GROUP_SCOPE_DEFAULT = os.getenv("GROUP_SCOPE_DEFAULT", "hybrid").lower()
 
 OPENWEATHERMAP_API_KEY = os.getenv("OPENWEATHERMAP_API_KEY", "")
 WEATHER_DEFAULT_CITY   = os.getenv("WEATHER_DEFAULT_CITY", "Moscow")
+
+# Веб-поиск (серверный инструмент Anthropic). Включён по умолчанию, отключается env-флагом.
+WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "1") == "1"
+WEB_SEARCH_MAX_USES = int(os.getenv("WEB_SEARCH_MAX_USES", "3"))
+
+# Распознавание изображений
+VISION_ENABLED = os.getenv("VISION_ENABLED", "1") == "1"
 
 # ---- Weather tool ----
 
@@ -69,6 +77,51 @@ def _fetch_weather(city: str) -> str:
         return f"Не удалось получить погоду: {e}"
 
 
+def _fetch_forecast(city: str, day: str = "tomorrow") -> str:
+    """Прогноз погоды на сегодня/завтра через OpenWeatherMap (5-day/3-hour)."""
+    if not OPENWEATHERMAP_API_KEY:
+        return "Прогноз недоступен: не настроен OPENWEATHERMAP_API_KEY"
+    try:
+        import requests
+        url = (
+            f"https://api.openweathermap.org/data/2.5/forecast"
+            f"?q={city}&appid={OPENWEATHERMAP_API_KEY}&units=metric&lang=ru"
+        )
+        r = requests.get(url, timeout=6)
+        d = r.json()
+        if r.status_code == 404:
+            return f"Город '{city}' не найден. Уточни название."
+        if r.status_code != 200:
+            return f"Ошибка прогноза: {d.get('message', r.status_code)}"
+
+        # Локальное время города из смещения в ответе
+        tz = datetime.timezone(datetime.timedelta(seconds=int(d.get("city", {}).get("timezone", 0))))
+        today = datetime.datetime.now(tz).date()
+        target = today + datetime.timedelta(days=0 if day == "today" else 1)
+
+        temps, descs = [], {}
+        for item in d.get("list", []):
+            t = datetime.datetime.fromtimestamp(item["dt"], tz)
+            if t.date() != target:
+                continue
+            temps.append(item["main"]["temp"])
+            desc = item["weather"][0]["description"]
+            descs[desc] = descs.get(desc, 0) + 1
+        if not temps:
+            return f"Нет данных прогноза на {target.strftime('%d.%m')} для {city}."
+
+        main_desc = max(descs, key=descs.get) if descs else ""
+        name = d.get("city", {}).get("name", city)
+        label = "сегодня" if day == "today" else "завтра"
+        return (
+            f"Прогноз в {name} на {label} ({target.strftime('%d.%m')}): "
+            f"{main_desc}, от {min(temps):.0f}°C до {max(temps):.0f}°C"
+        )
+    except Exception as e:
+        logger.warning("Forecast fetch failed: %s", e)
+        return f"Не удалось получить прогноз: {e}"
+
+
 WEATHER_TOOL = {
     "name": "get_weather",
     "description": "Получить текущую погоду в указанном городе",
@@ -84,13 +137,101 @@ WEATHER_TOOL = {
     },
 }
 
+FORECAST_TOOL = {
+    "name": "get_forecast",
+    "description": "Получить прогноз погоды на сегодня или завтра в указанном городе",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "city": {
+                "type": "string",
+                "description": "Название города (например: Moscow, Москва, London)",
+            },
+            "day": {
+                "type": "string",
+                "enum": ["today", "tomorrow"],
+                "description": "На какой день нужен прогноз (по умолчанию tomorrow)",
+            },
+        },
+        "required": ["city"],
+    },
+}
 
-def _tool_executor(tool_name: str, tool_input: Dict[str, Any]) -> str:
-    """Роутер вызовов инструментов от Claude."""
-    if tool_name == "get_weather":
-        city = tool_input.get("city") or WEATHER_DEFAULT_CITY
-        return _fetch_weather(city)
-    return f"Неизвестный инструмент: {tool_name}"
+REMEMBER_TOOL = {
+    "name": "remember_fact",
+    "description": (
+        "Сохранить в долговременную память важный устойчивый факт о собеседнике "
+        "(предпочтение, деталь о работе/жизни, договорённость), чтобы помнить его в будущих беседах. "
+        "Используй, когда собеседник просит запомнить или сообщает значимую устойчивую информацию о себе. "
+        "Не сохраняй сиюминутное и неважное."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "fact": {
+                "type": "string",
+                "description": (
+                    "Краткий факт от третьего лица, напр.: 'Любит крепкий чёрный кофе без сахара' "
+                    "или 'Работает в отделе контроллинга'"
+                ),
+            }
+        },
+        "required": ["fact"],
+    },
+}
+
+FORGET_TOOL = {
+    "name": "forget_fact",
+    "description": (
+        "Удалить ранее сохранённый факт о собеседнике из долговременной памяти. "
+        "Используй, когда собеседник просит что-то забыть или информация устарела."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Ключевые слова факта, который нужно забыть. Пусто — забыть всё.",
+            }
+        },
+        "required": [],
+    },
+}
+
+# Серверный инструмент Anthropic — выполняется на стороне API.
+WEB_SEARCH_TOOL = {
+    "type": "web_search_20250305",
+    "name": "web_search",
+    "max_uses": WEB_SEARCH_MAX_USES,
+}
+
+
+def _make_tool_executor(user_id: Optional[str]):
+    """Создаёт роутер инструментов, замкнутый на текущего пользователя (для памяти)."""
+
+    def _route(tool_name: str, tool_input: Dict[str, Any]) -> str:
+        if tool_name == "get_weather":
+            return _fetch_weather(tool_input.get("city") or WEATHER_DEFAULT_CITY)
+        if tool_name == "get_forecast":
+            return _fetch_forecast(
+                tool_input.get("city") or WEATHER_DEFAULT_CITY,
+                (tool_input.get("day") or "tomorrow"),
+            )
+        if tool_name == "remember_fact":
+            if not user_id:
+                return "Не могу сохранить: неизвестен пользователь."
+            fact = (tool_input.get("fact") or "").strip()
+            if not fact:
+                return "Пустой факт — нечего запоминать."
+            return "Запомнил." if add_user_fact(user_id, fact) else "Не удалось сохранить факт."
+        if tool_name == "forget_fact":
+            if not user_id:
+                return "Не могу: неизвестен пользователь."
+            n = remove_user_facts(user_id, tool_input.get("query"))
+            return f"Забыл ({n})." if n else "Подходящих фактов не нашёл."
+        return f"Неизвестный инструмент: {tool_name}"
+
+    return _route
 
 
 def dialog_key_for(chat_type: Optional[str], chat_id: int, user_id: Optional[int], thread_id: Optional[int]) -> str:
@@ -201,9 +342,30 @@ def _parse_update(raw: str) -> Dict[str, Any]:
     first_name = from_user.get("first_name")
     last_name = from_user.get("last_name")
     text = msg.get("text") or msg.get("caption") or ""
-    entities = msg.get("entities") or []
+    entities = msg.get("entities") or msg.get("caption_entities") or []
     reply_msg = msg.get("reply_to_message") or {}
     reply_from = reply_msg.get("from") or {}
+
+    # Изображение: telegram присылает photo как массив размеров — берём крупнейший
+    # в пределах бюджета по размеру; альтернативно — документ с image/* mime.
+    photo_file_id = None
+    photos = msg.get("photo") or []
+    if photos:
+        ranked = sorted(photos, key=lambda p: (p.get("file_size") or (p.get("width", 0) * p.get("height", 0))))
+        chosen = None
+        for p in reversed(ranked):  # от крупного к мелкому
+            fs = p.get("file_size") or 0
+            if fs == 0 or fs <= 3_500_000:
+                chosen = p
+                break
+        if chosen is None:
+            chosen = ranked[0]
+        photo_file_id = chosen.get("file_id")
+    if not photo_file_id:
+        doc = msg.get("document") or {}
+        if str(doc.get("mime_type") or "").startswith("image/"):
+            photo_file_id = doc.get("file_id")
+
     return {
         "chat_id": chat_id,
         "chat_type": chat_type,
@@ -215,6 +377,7 @@ def _parse_update(raw: str) -> Dict[str, Any]:
         "last_name": last_name,
         "text": text,
         "entities": entities,
+        "photo_file_id": photo_file_id,
         "reply_to": {
             "from_id": reply_from.get("id"),
             "from_username": (reply_from.get("username") or ""),
@@ -237,10 +400,17 @@ def _process_one(update_raw: str) -> str:
     last_name = parsed.get("last_name")
     entities  = parsed.get("entities") or []
     reply_to  = parsed.get("reply_to") or {}
+    photo_file_id = parsed.get("photo_file_id")
+    has_image = bool(photo_file_id and VISION_ENABLED)
 
     if not (chat_id and msg_id):
         logger.info("No chat/message id → skip")
         return "No-op"
+
+    # Для сообщения с картинкой без подписи сохраняем плейсхолдер, чтобы история не была пустой
+    stored_text = text
+    if has_image and not (text or "").strip():
+        stored_text = "[изображение]"
 
     dkey = dialog_key_for(chat_type, chat_id, user_id, thread_id)
     logger.info("ctx dkey=%s chat=%s/%s msg=%s", dkey, chat_type, chat_id, msg_id)
@@ -262,11 +432,11 @@ def _process_one(update_raw: str) -> str:
         logger.warning("STEP1 ensure entities failed: %s", e)
 
     try:
-        if (text or "").strip():
+        if (stored_text or "").strip():
             save_message(
                 dkey,
                 "user",
-                text,
+                stored_text,
                 from_user=str(user_id) if user_id else None,
                 from_username=username,
             )
@@ -393,6 +563,11 @@ def _process_one(update_raw: str) -> str:
                 if last_topics:
                     profile_parts.append(f"- Последние темы: {', '.join(last_topics)}")
 
+                # Явно сохранённые факты (долговременная память)
+                facts = user_profile.get("facts", [])
+                if facts:
+                    profile_parts.append("- Что важно помнить: " + "; ".join(facts))
+
                 if len(profile_parts) > 1:  # Если есть хоть что-то кроме заголовка
                     profile_parts.append("\nОтвечай персонализированно, учитывая этот контекст и стиль собеседника.")
                     system_parts.append("\n".join(profile_parts))
@@ -467,6 +642,15 @@ def _process_one(update_raw: str) -> str:
             )
 
         system_parts.append(scope_msg)
+
+        # Долговременная память о текущем авторе (работает и в группах)
+        try:
+            author_prof = get_cached_profile(str(user_id))
+            author_facts = (author_prof or {}).get("facts", [])
+            if author_facts:
+                system_parts.append("Важно помнить о текущем авторе: " + "; ".join(author_facts))
+        except Exception as e:
+            logger.warning("Failed to add author facts: %s", e)
 
     chat_msgs = []
     for m in history:
@@ -550,13 +734,53 @@ def _process_one(update_raw: str) -> str:
     messages = _view(chat_msgs)
     logger.info("STEP5 messages_ready=%d tokens~%d", len(messages), total_tokens())
 
-    _active_tools = [WEATHER_TOOL] if OPENWEATHERMAP_API_KEY else []
+    # --- Инструменты (tool use) ---
+    client_tools = []
+    if OPENWEATHERMAP_API_KEY:
+        client_tools.append(WEATHER_TOOL)
+        client_tools.append(FORECAST_TOOL)
+    if user_id:  # инструменты памяти требуют известного пользователя
+        client_tools.append(REMEMBER_TOOL)
+        client_tools.append(FORGET_TOOL)
+    server_tools = [WEB_SEARCH_TOOL] if WEB_SEARCH_ENABLED else []
+    active_tools = (client_tools + server_tools) or None
+
+    # Подсказка модели о доступных инструментах
+    hints = []
+    if server_tools:
+        hints.append("Если для ответа нужны свежие или точные факты из интернета — используй веб-поиск (web_search).")
+    if any(t.get("name") == "remember_fact" for t in client_tools):
+        hints.append(
+            "Если собеседник сообщает важную устойчивую информацию о себе или просит запомнить/забыть — "
+            "пользуйся инструментами памяти (remember_fact/forget_fact)."
+        )
+    if hints:
+        system_prompt = system_prompt + "\n\n" + "\n".join(hints)
+
+    # --- Изображение: подмешиваем в последнее сообщение пользователя ---
+    if has_image:
+        b64, mime = get_file_base64(photo_file_id)
+        if b64:
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i]["role"] == "user":
+                    txt = messages[i]["content"]
+                    blocks = [{"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}}]
+                    if isinstance(txt, str) and txt.strip():
+                        blocks.append({"type": "text", "text": txt})
+                    else:
+                        blocks.append({"type": "text", "text": "[пользователь прислал изображение]"})
+                    messages[i]["content"] = blocks
+                    break
+            logger.info("STEP5b image attached (%s)", mime)
+        else:
+            logger.warning("STEP5b image download failed, proceeding text-only")
+
     ai_resp = generate_response(
         messages,
         system=system_prompt,
         max_tokens=MAX_OUTPUT_TOKENS,
-        tools=_active_tools or None,
-        tool_executor=_tool_executor if _active_tools else None,
+        tools=active_tools,
+        tool_executor=_make_tool_executor(str(user_id) if user_id else None) if active_tools else None,
     )
     if (ai_resp or "").strip().lower() in {"assistant","system","user",""}:
         logger.warning("STEP6 non-text placeholder from model: %r", ai_resp)

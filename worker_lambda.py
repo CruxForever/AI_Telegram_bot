@@ -3,6 +3,7 @@ import datetime
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, Optional
 
 from dynamo_utils import (
@@ -10,7 +11,7 @@ from dynamo_utils import (
     get_channel, save_channel,
     get_thread, save_thread,
     save_message, get_dialog_history,
-    get_latest_summary, save_summary,
+    get_latest_summary, get_latest_summary_item, save_summary,
     get_settings, save_settings, update_settings,
     update_user_names,
     update_user_profile,
@@ -33,6 +34,10 @@ MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "6000"))
 MAX_OUTPUT_TOKENS  = int(os.getenv("MAX_OUTPUT_TOKENS",  "800"))
 MIN_MSGS_FOR_SUMMARY   = int(os.getenv("MIN_MSGS_FOR_SUMMARY", "12"))
 SUMMARY_HISTORY_LIMIT  = int(os.getenv("SUMMARY_HISTORY_LIMIT", "60"))
+# Троттлинг: не перегенерировать краткую сводку чаще, чем раз в N секунд (раньше — каждый ход)
+SUMMARY_MIN_INTERVAL_SEC = int(os.getenv("SUMMARY_MIN_INTERVAL_SEC", "600"))
+# Долгосрочный профиль (private) обновляется раз в LONG_TERM_EVERY сообщений
+LONG_TERM_EVERY = int(os.getenv("LONG_TERM_EVERY", "50"))
 BASE_SYSTEM_PROMPT     = os.getenv("BASE_SYSTEM_PROMPT", "").strip()
 BOT_USERNAME = (os.getenv("BOT_USERNAME") or "").lstrip("@").lower()
 BOT_ID = int(os.getenv("BOT_ID", "0")) or None
@@ -510,18 +515,18 @@ def _process_one(update_raw: str) -> str:
     except Exception as e:
         logger.warning("STEP4 gate failed (continue anyway): %s", e)
 
+    # Стабильный префикс (BASE_SYSTEM_PROMPT) идёт первым — удобно для будущего prompt caching.
+    # Волатильную дату/время добавляем в самом КОНЦЕ системного промпта (см. ниже), чтобы она
+    # не ломала кэшируемый префикс.
     system_parts = []
-    # Текущая дата и время МСК — модель не знает их без явной передачи
-    _tz_msk = datetime.timezone(datetime.timedelta(hours=3))
-    _now = datetime.datetime.now(_tz_msk)
-    system_parts.append(f"Текущая дата и время: {_now.strftime('%d.%m.%Y %H:%M')} (МСК)")
     if BASE_SYSTEM_PROMPT:
         system_parts.append(BASE_SYSTEM_PROMPT)
     try:
-        summary = get_latest_summary(dkey)
+        summary_item = get_latest_summary_item(dkey)
     except Exception as e:
         logger.warning("Get summary failed: %s", e)
-        summary = None
+        summary_item = None
+    summary = (summary_item or {}).get("summary")
     if summary:
         system_parts.append(f"Dialog summary: {summary}")
 
@@ -768,6 +773,10 @@ def _process_one(update_raw: str) -> str:
     if hints:
         system_prompt = system_prompt + "\n\n" + "\n".join(hints)
 
+    # Текущая дата/время МСК — волатильно, поэтому в самом конце (не ломает будущий кэш префикса)
+    _now_msk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3)))
+    system_prompt = system_prompt + "\n\n" + f"Текущая дата и время: {_now_msk.strftime('%d.%m.%Y %H:%M')} (МСК)"
+
     # Стиль-файрвол — последним, чтобы быть самой «свежей» инструкцией для модели
     system_prompt = system_prompt + "\n\n" + STYLE_ANCHOR
 
@@ -819,43 +828,45 @@ def _process_one(update_raw: str) -> str:
         except Exception as e:
             logger.warning("Failed to increment message count: %s", e)
 
-    # Регулярное обновление саммари и профиля
+    # STEP8: обновление памяти.
+    #  - Краткая сводка троттлится по времени (раньше регенерилась КАЖДЫЙ ход — лишний вызов Claude).
+    #  - Долгосрочный профиль (private) обновляется раз в LONG_TERM_EVERY сообщений
+    #    (раньше ветка была мёртвой: full брался с limit=24, а проверялось len>=50).
     try:
         full = get_dialog_history(dkey, limit=MIN_MSGS_FOR_SUMMARY * 2, consistent_read=True)
         if len(full) >= MIN_MSGS_FOR_SUMMARY:
-            # Обновить краткую сводку
-            sm = summarize_history(full[-SUMMARY_HISTORY_LIMIT:])
-            if sm:
-                save_summary(dkey, sm)
+            last_ts = (summary_item or {}).get("timestamp")
+            now_ms = int(time.time() * 1000)
+            stale = (last_ts is None) or (now_ms - int(last_ts) > SUMMARY_MIN_INTERVAL_SEC * 1000)
+            if stale:
+                sm = summarize_history(full[-SUMMARY_HISTORY_LIMIT:])
+                if sm:
+                    save_summary(dkey, sm)
+                logger.info("STEP8 summary refreshed")
+            else:
+                logger.info("STEP8 summary skipped (throttled)")
 
-            # НОВОЕ: Обновить долгосрочный профиль для приватных чатов
-            if chat_type == "private" and user_id and len(full) >= 50:
+        # Долгосрочный профиль — только private, раз в LONG_TERM_EVERY сообщений
+        if chat_type == "private" and user_id:
+            prof = get_user_profile(str(user_id)) or {}
+            mc = int(prof.get("message_count", 0) or 0)
+            if mc >= LONG_TERM_EVERY and mc % LONG_TERM_EVERY == 0:
                 try:
-                    user_profile = get_cached_profile(str(user_id))
-                    user_info = {
-                        "first_name": user_profile.get("first_name", "") if user_profile else "",
-                        "username": username,
-                    }
-
-                    # Создать долгосрочную сводку
-                    long_summary = create_long_term_summary(full[-80:], user_info)
-
-                    # Извлечь темы из последних сообщений
-                    recent_topics = extract_topics(full[-20:])
-
-                    # Обновить профиль
+                    hist = get_dialog_history(dkey, limit=80, consistent_read=True)
+                    user_info = {"first_name": prof.get("first_name", ""), "username": username}
+                    long_summary = create_long_term_summary(hist[-80:], user_info)
+                    recent_topics = extract_topics(hist[-20:])
                     if long_summary or recent_topics:
                         update_user_profile(
                             str(user_id),
                             long_term_summary=long_summary if long_summary else None,
                             last_topics=recent_topics if recent_topics else None,
                         )
-
-                    logger.info("Updated long-term profile for user %s", user_id)
+                    logger.info("Updated long-term profile for user %s (mc=%d)", user_id, mc)
                 except Exception as e:
                     logger.warning("Failed to update long-term profile: %s", e)
 
-        logger.info("STEP8 summarized")
+        logger.info("STEP8 done")
     except Exception as e:
         logger.warning("Update summary failed: %s", e)
 

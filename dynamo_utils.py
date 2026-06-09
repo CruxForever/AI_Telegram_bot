@@ -439,6 +439,20 @@ def get_latest_summary(dialog_key: str) -> Optional[str]:
         logger.warning(f"get_latest_summary({dialog_key}) failed: {e}")
         return None
 
+def get_latest_summary_item(dialog_key: str) -> Optional[Dict[str, Any]]:
+    """Последний элемент сводки целиком (с `timestamp`) или None — для троттлинга по времени."""
+    try:
+        r = summaries_tbl.query(
+            KeyConditionExpression=Key("dialog_key").eq(dialog_key),
+            ScanIndexForward=False,  # newest first
+            Limit=1
+        )
+        items = r.get("Items", [])
+        return items[0] if items else None
+    except Exception as e:
+        logger.warning(f"get_latest_summary_item({dialog_key}) failed: {e}")
+        return None
+
 # ---------- Settings ----------
 
 def get_settings(dialog_key: str) -> Optional[Dict[str, Any]]:

@@ -25,6 +25,42 @@ DEFAULT_PARSE_MODE = os.getenv("TELEGRAM_PARSE_MODE") or None  # None -> plain t
 _ALLOWED_IMAGE_MIME = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
 
+def get_file_bytes(file_id: str, *, max_bytes: int = 20_000_000) -> Tuple[Optional[bytes], Optional[str]]:
+    """Скачивает файл Telegram по file_id и возвращает (bytes, file_path) или (None, None).
+
+    file_path нужен вызывающему, чтобы определить формат по расширению.
+    Лимит Bot API на getFile — 20 МБ.
+    """
+    if not file_id:
+        return None, None
+    try:
+        r = requests.get(GETFILE_URL, params={"file_id": file_id}, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        info = r.json()
+        if not info.get("ok"):
+            logger.warning("getFile not ok: %s", info)
+            return None, None
+        result = info.get("result", {})
+        file_path = result.get("file_path")
+        file_size = result.get("file_size") or 0
+        if not file_path:
+            return None, None
+        if file_size and file_size > max_bytes:
+            logger.warning("Telegram file too large: %s bytes", file_size)
+            return None, None
+
+        fr = requests.get(f"{FILE_BASE}/{file_path}", timeout=REQUEST_TIMEOUT)
+        fr.raise_for_status()
+        data = fr.content
+        if len(data) > max_bytes:
+            logger.warning("Downloaded file too large: %s bytes", len(data))
+            return None, None
+        return data, file_path
+    except Exception as e:
+        logger.warning("get_file_bytes(%s) failed: %s", file_id, e)
+        return None, None
+
+
 def get_file_base64(file_id: str, *, max_bytes: int = 3_500_000) -> Tuple[Optional[str], Optional[str]]:
     """Скачивает файл Telegram по file_id и возвращает (base64, mime) или (None, None).
 

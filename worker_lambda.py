@@ -25,7 +25,7 @@ from claude_utils import (
     create_long_term_summary,
     extract_topics,
 )
-from telegram_utils import send_message, send_chat_action, get_file_base64
+from telegram_utils import send_message, send_chat_action, get_file_base64, get_file_bytes
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -52,6 +52,47 @@ WEB_SEARCH_MAX_USES = int(os.getenv("WEB_SEARCH_MAX_USES", "3"))
 
 # Распознавание изображений
 VISION_ENABLED = os.getenv("VISION_ENABLED", "1") == "1"
+
+# Распознавание голосовых: Claude API аудио не принимает, транскрибируем через
+# OpenAI Whisper (requests уже в слое, новых зависимостей нет).
+VOICE_ENABLED = os.getenv("VOICE_ENABLED", "1") == "1"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-mini-transcribe")
+VOICE_MAX_DURATION_SEC = int(os.getenv("VOICE_MAX_DURATION_SEC", "300"))
+
+
+def _transcribe_voice(file_id: str, duration: int) -> Optional[str]:
+    """Скачивает голосовое из Telegram и транскрибирует через OpenAI STT.
+    Возвращает текст или None (нет ключа / слишком длинное / ошибка)."""
+    if not OPENAI_API_KEY:
+        logger.warning("Voice skipped: OPENAI_API_KEY is not set")
+        return None
+    if duration and duration > VOICE_MAX_DURATION_SEC:
+        logger.warning("Voice skipped: too long (%ds > %ds)", duration, VOICE_MAX_DURATION_SEC)
+        return None
+    data, file_path = get_file_bytes(file_id)
+    if not data:
+        return None
+    ext = (file_path.rsplit(".", 1)[-1] if file_path and "." in file_path else "ogg").lower()
+    if ext == "oga":  # telegram-голосовые приходят .oga; OpenAI знает это как ogg
+        ext = "ogg"
+    try:
+        import requests
+        r = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            data={"model": STT_MODEL, "response_format": "text"},
+            files={"file": (f"voice.{ext}", data, f"audio/{ext}")},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            logger.warning("STT error %s: %s", r.status_code, r.text[:200])
+            return None
+        transcript = (r.text or "").strip()
+        return transcript or None
+    except Exception as e:
+        logger.warning("STT request failed: %s", e)
+        return None
 
 # Стиль-файрвол: история переписки даётся модели как факты/контекст, но её ФОРМА не должна
 # копироваться. Ставится последним блоком системного промпта (макс. салиентность), чтобы
@@ -382,6 +423,11 @@ def _parse_update(raw: str) -> Dict[str, Any]:
         if str(doc.get("mime_type") or "").startswith("image/"):
             photo_file_id = doc.get("file_id")
 
+    # Голосовое сообщение (voice note)
+    voice = msg.get("voice") or {}
+    voice_file_id = voice.get("file_id")
+    voice_duration = int(voice.get("duration") or 0)
+
     return {
         "chat_id": chat_id,
         "chat_type": chat_type,
@@ -394,6 +440,8 @@ def _parse_update(raw: str) -> Dict[str, Any]:
         "text": text,
         "entities": entities,
         "photo_file_id": photo_file_id,
+        "voice_file_id": voice_file_id,
+        "voice_duration": voice_duration,
         "reply_to": {
             "from_id": reply_from.get("id"),
             "from_username": (reply_from.get("username") or ""),
@@ -422,6 +470,31 @@ def _process_one(update_raw: str) -> str:
     if not (chat_id and msg_id):
         logger.info("No chat/message id → skip")
         return "No-op"
+
+    # STEP0v: голосовое → текст (до сохранения в историю и mention-детекции)
+    voice_file_id = parsed.get("voice_file_id")
+    if voice_file_id and VOICE_ENABLED:
+        if chat_type == "private":
+            try:
+                send_chat_action(chat_id, action="typing", thread_id=thread_id)
+            except Exception:
+                pass
+        transcript = _transcribe_voice(voice_file_id, parsed.get("voice_duration") or 0)
+        if transcript:
+            voice_text = f"[голосовое сообщение] {transcript}"
+            text = f"{text}\n{voice_text}".strip() if (text or "").strip() else voice_text
+            logger.info("STEP0v voice transcribed (%ds, %d chars)",
+                        parsed.get("voice_duration") or 0, len(transcript))
+        else:
+            logger.warning("STEP0v voice transcription failed/skipped")
+            # В личке молчание хуже честного ответа; в группах тихо пропускаем
+            if chat_type == "private" and not (text or "").strip():
+                try:
+                    send_message(chat_id, "Не получилось разобрать голосовое — продублируй текстом, пожалуйста.",
+                                 chat_type=chat_type, thread_id=thread_id, reply_to=msg_id)
+                except Exception as e:
+                    logger.warning("send_message(voice-fail) failed: %s", e)
+                return "Voice transcription failed"
 
     # Для сообщения с картинкой без подписи сохраняем плейсхолдер, чтобы история не была пустой
     stored_text = text

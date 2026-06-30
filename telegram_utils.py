@@ -17,6 +17,7 @@ FILE_BASE  = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}"
 SEND_URL   = API_BASE + "/sendMessage"
 ACTION_URL = API_BASE + "/sendChatAction"
 GETFILE_URL = API_BASE + "/getFile"
+REACTION_URL = API_BASE + "/setMessageReaction"
 
 REQUEST_TIMEOUT = 30
 DEFAULT_PARSE_MODE = os.getenv("TELEGRAM_PARSE_MODE") or None  # None -> plain text
@@ -161,3 +162,28 @@ def send_chat_action(chat_id: int, *, action: str = "typing", thread_id: Optiona
             f"send_chat_action failed for chat_id={chat_id}, "
             f"thread_id={thread_id}, action={action}: {e} — {getattr(r, 'text', '')}"
         )
+
+def set_message_reaction(chat_id: int, message_id: int, emoji: str, *, is_big: bool = False) -> bool:
+    """Ставит эмодзи-реакцию на сообщение/пост (Bot API 7.0+).
+
+    Возвращает True при успехе. Не-200 (нет прав в канале, недопустимый эмодзи и т.п.)
+    логируется как info и не считается ошибкой — реакция вторична.
+    """
+    if not emoji:
+        return False
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reaction": [{"type": "emoji", "emoji": emoji}],
+        "is_big": is_big,
+    }
+    try:
+        r = requests.post(REACTION_URL, json=payload, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            logger.info("set_message_reaction non-200 (chat=%s msg=%s emoji=%s): %s",
+                        chat_id, message_id, emoji, getattr(r, "text", "")[:200])
+            return False
+        return True
+    except Exception as e:
+        logger.warning("set_message_reaction failed (chat=%s msg=%s): %s", chat_id, message_id, e)
+        return False

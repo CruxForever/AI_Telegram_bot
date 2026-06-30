@@ -24,8 +24,11 @@ from claude_utils import (
     summarize_history,
     create_long_term_summary,
     extract_topics,
+    choose_reaction,
 )
-from telegram_utils import send_message, send_chat_action, get_file_base64, get_file_bytes
+from telegram_utils import (
+    send_message, send_chat_action, get_file_base64, get_file_bytes, set_message_reaction,
+)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -59,6 +62,31 @@ VOICE_ENABLED = os.getenv("VOICE_ENABLED", "1") == "1"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-mini-transcribe")
 VOICE_MAX_DURATION_SEC = int(os.getenv("VOICE_MAX_DURATION_SEC", "300"))
+
+# Эмодзи-реакции на прочитанные, но НЕ отвеченные сообщения/посты (выборочно, через модель)
+REACTIONS_ENABLED = os.getenv("REACTIONS_ENABLED", "1") == "1"
+
+
+def _maybe_react(chat_id: int, message_id: int, text: str) -> None:
+    """Выборочно ставит эмодзи-реакцию на прочитанное, но не отвеченное сообщение.
+
+    Вызывается на «молчаливом» пути (бот прочитал, но не отвечает). Модель сама решает,
+    реагировать ли (в большинстве случаев — нет). Любые сбои не влияют на основной поток.
+    """
+    if not REACTIONS_ENABLED:
+        return
+    t = (text or "").strip()
+    if len(t) < 2:
+        return
+    try:
+        emoji = choose_reaction(t)
+        if emoji:
+            ok = set_message_reaction(chat_id, message_id, emoji)
+            logger.info("STEP4r reaction %s -> %s", emoji, "ok" if ok else "fail")
+        else:
+            logger.info("STEP4r no reaction")
+    except Exception as e:
+        logger.warning("STEP4r reaction error: %s", e)
 
 
 def _transcribe_voice(file_id: str, duration: int) -> Optional[str]:
@@ -585,6 +613,9 @@ def _process_one(update_raw: str) -> str:
         mode = (st or {}).get("mode") or default_mode_for(chat_type)
         if not should_respond_by_mode(mode, chat_type, mentioned):
             logger.info("STEP4 skip by mode=%s; mentioned=%s; text=%r", mode, mentioned, (text[:80] if text else ""))
+            # Бот молчит, но прочитал — выборочно ставим реакцию (кроме режима off)
+            if mode != "off":
+                _maybe_react(chat_id, msg_id, text)
             return "Skipped"
         logger.info("STEP4 mention ok (mode=%s, mentioned=%s)", mode, mentioned)
     except Exception as e:

@@ -6,7 +6,14 @@ from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
+
+# Режим размышлений. У Sonnet 5 / Opus 4.6+ / Fable adaptive-thinking включён по умолчанию
+# при ОТСУТСТВИИ параметра — поэтому задаём его явно.
+#   "disabled" — быстро и дёшево, весь MAX_OUTPUT_TOKENS идёт в ответ (поведение как на Haiku).
+#   "adaptive" — глубже рассуждает, но часть выходного бюджета уходит на мысли (тогда стоит
+#                поднять MAX_OUTPUT_TOKENS, иначе ответ может обрезаться).
+_THINKING_MODE = os.getenv("THINKING_MODE", "disabled").lower()
 
 # --------- Anthropic SDK init ---------
 _client = None
@@ -116,8 +123,7 @@ def _extract_text(resp) -> str:
     return "\n".join(text_parts).strip()
 
 
-def _chat(messages: List[Dict[str, Any]], system: str,
-          temperature: float, max_tokens: int,
+def _chat(messages: List[Dict[str, Any]], system: str, max_tokens: int,
           tools: Optional[List[Dict[str, Any]]] = None,
           tool_executor=None) -> str:
     if _client is None:
@@ -135,8 +141,12 @@ def _chat(messages: List[Dict[str, Any]], system: str,
             "model": model,
             "max_tokens": max_tokens,
             "messages": list(safe_messages),
-            "temperature": temperature,
         }
+        # Современные модели (Sonnet 5, Opus 4.6+, Fable) отклоняют temperature/top_p/top_k
+        # с 400 — не передаём их. Режимом рассуждений управляем через thinking.
+        kwargs["thinking"] = (
+            {"type": "adaptive"} if _THINKING_MODE == "adaptive" else {"type": "disabled"}
+        )
         if system:
             kwargs["system"] = system
         if active_tools:
@@ -203,7 +213,6 @@ def _chat(messages: List[Dict[str, Any]], system: str,
 
 def generate_response(messages: List[Dict[str, Any]], *,
                       system: str = "",
-                      temperature: float = 0.5,
                       max_tokens: int = 800,
                       tools: Optional[List[Dict[str, Any]]] = None,
                       tool_executor=None) -> str:
@@ -211,7 +220,7 @@ def generate_response(messages: List[Dict[str, Any]], *,
     tools — список инструментов для tool use (опционально).
     tool_executor — callable(tool_name, tool_input) -> str (опционально).
     """
-    return _chat(messages, system, temperature, max_tokens,
+    return _chat(messages, system, max_tokens,
                  tools=tools, tool_executor=tool_executor)
 
 
@@ -261,7 +270,7 @@ def summarize_history(
             user_info += f"Username: @{user_context['username']}\n"
         system += user_info
 
-    return _chat(few, system, temperature=0.3, max_tokens=600)
+    return _chat(few, system, max_tokens=600)
 
 
 def create_long_term_summary(
@@ -286,7 +295,7 @@ def create_long_term_summary(
     if user_info.get("first_name"):
         system += f"\n\nИмя пользователя: {user_info['first_name']}"
 
-    return _chat(messages, system, temperature=0.3, max_tokens=400)
+    return _chat(messages, system, max_tokens=400)
 
 
 def extract_topics(messages: List[Dict[str, Any]], max_topics: int = 5) -> List[str]:
@@ -300,7 +309,7 @@ def extract_topics(messages: List[Dict[str, Any]], max_topics: int = 5) -> List[
     few = [{"role": m["role"], "content": _plain_text(m.get("content", ""))} for m in messages[-10:]]
 
     try:
-        result = _chat(few, system, temperature=0.2, max_tokens=100)
+        result = _chat(few, system, max_tokens=100)
         # Парсим темы
         topics = [t.strip() for t in result.split(",") if t.strip()]
         return topics[:max_topics]
@@ -337,7 +346,7 @@ def choose_reaction(text: str) -> str:
     )
     few = [{"role": "user", "content": (text or "")[:500]}]
     try:
-        result = (_chat(few, system, temperature=0.4, max_tokens=12) or "").strip()
+        result = (_chat(few, system, max_tokens=12) or "").strip()
     except Exception:
         return ""
     if not result or "NONE" in result.upper():

@@ -115,12 +115,17 @@ def _client_tools_only(tools: Optional[List[Dict[str, Any]]]) -> Optional[List[D
 
 
 def _extract_text(resp) -> str:
-    """Достаёт текстовые блоки из ответа Claude (игнорируя tool_use/web_search блоки)."""
+    """Достаёт текстовые блоки из ответа Claude (игнорируя tool_use/web_search блоки).
+
+    Склеиваем БЕЗ разделителя: при веб-поиске/цитатах Sonnet 5 разбивает ответ на
+    несколько text-блоков посреди предложения — вставка "\\n" уводила бы знаки
+    препинания на новую строку. Модель сама расставляет переносы внутри блоков.
+    """
     text_parts = []
     for block in getattr(resp, "content", []) or []:
         if getattr(block, "type", None) == "text" and hasattr(block, "text"):
             text_parts.append(block.text)
-    return "\n".join(text_parts).strip()
+    return "".join(text_parts).strip()
 
 
 def _chat(messages: List[Dict[str, Any]], system: str, max_tokens: int,

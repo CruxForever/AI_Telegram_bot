@@ -22,9 +22,13 @@ def _parse_for_keys(update: Dict[str, Any]) -> Dict[str, Any]:
     from_user = msg.get("from") or {}
     user_id = from_user.get("id")
     update_id = update.get("update_id")
+    # Логика ключа зеркалит worker_lambda.dialog_key_for: thread_id идёт в ключ только для
+    # настоящих форум-топиков. Здесь ключ используется как MessageGroupId (FIFO-порядок),
+    # поэтому расхождение с воркером означало бы параллельную обработку одного чата.
+    is_topic = bool(msg.get("is_topic_message"))
     if chat_type == "private" and user_id:
         dkey = str(user_id)
-    elif thread_id:
+    elif thread_id and is_topic:
         dkey = f"{chat_id}:{thread_id}"
     else:
         dkey = str(chat_id)

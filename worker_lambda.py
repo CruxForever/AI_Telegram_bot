@@ -321,10 +321,20 @@ def _make_tool_executor(user_id: Optional[str]):
     return _route
 
 
-def dialog_key_for(chat_type: Optional[str], chat_id: int, user_id: Optional[int], thread_id: Optional[int]) -> str:
+def dialog_key_for(chat_type: Optional[str], chat_id: int, user_id: Optional[int],
+                   thread_id: Optional[int], is_topic: bool = False) -> str:
+    """Ключ истории диалога.
+
+    ВАЖНО: thread_id попадает в ключ ТОЛЬКО для настоящих форум-топиков (`is_topic_message`).
+    В группе-обсуждении, привязанной к каналу, Telegram даёт свой thread_id каждому посту —
+    раньше из-за этого история дробилась на сотни огрызков (881 ключ на 7982 сообщения,
+    501 «тред» по 1-2 сообщения), и бот честно не видел прошлых реплик. Комментарии под
+    постами теперь пишутся в общую историю чата; отвечает бот по-прежнему в нужный тред
+    (за это отвечает message_thread_id при отправке, он не связан с этим ключом).
+    """
     if chat_type == "private" and user_id:
         return str(user_id)
-    if thread_id:
+    if thread_id and is_topic:
         return f"{chat_id}:{thread_id}"
     return str(chat_id)
 
@@ -458,6 +468,9 @@ def _parse_update(raw: str) -> Dict[str, Any]:
     voice_file_id = voice.get("file_id")
     voice_duration = int(voice.get("duration") or 0)
 
+    # Настоящий форум-топик (а не тред комментариев под постом канала) — см. dialog_key_for
+    is_topic = bool(msg.get("is_topic_message"))
+
     return {
         "chat_id": chat_id,
         "chat_type": chat_type,
@@ -472,6 +485,7 @@ def _parse_update(raw: str) -> Dict[str, Any]:
         "photo_file_id": photo_file_id,
         "voice_file_id": voice_file_id,
         "voice_duration": voice_duration,
+        "is_topic": is_topic,
         "reply_to": {
             "from_id": reply_from.get("id"),
             "from_username": (reply_from.get("username") or ""),
@@ -531,17 +545,25 @@ def _process_one(update_raw: str) -> str:
     if has_image and not (text or "").strip():
         stored_text = "[изображение]"
 
-    dkey = dialog_key_for(chat_type, chat_id, user_id, thread_id)
+    dkey = dialog_key_for(chat_type, chat_id, user_id, thread_id, parsed.get("is_topic", False))
     logger.info("ctx dkey=%s chat=%s/%s msg=%s", dkey, chat_type, chat_id, msg_id)
 
     try:
-        if chat_type == "private" and user_id:
-            if not get_user(str(user_id)):
+        # Профиль автора сохраняем в ЛЮБОМ типе чата. Раньше это делалось только в личке,
+        # поэтому в группах бот не знал имён участников (63 из 76 авторов отсутствовали в
+        # Users) и не мог связать «Имя» с «@ником». Пишем только при реальном изменении —
+        # иначе это была бы лишняя запись в БД на каждое сообщение.
+        if user_id:
+            existing = get_user(str(user_id))
+            if not existing:
                 save_user(str(user_id), username, first_name=first_name, last_name=last_name)
             else:
-                # Обновить имя, если изменилось
-                update_user_names(str(user_id), username, first_name, last_name)
-        else:
+                prof = existing.get("profile") or {}
+                if ((username or "") != (existing.get("username") or "")
+                        or (first_name or "") != (prof.get("first_name") or "")
+                        or (last_name or "") != (prof.get("last_name") or "")):
+                    update_user_names(str(user_id), username, first_name, last_name)
+        if chat_type != "private":
             if not get_channel(str(chat_id)): save_channel(str(chat_id), None)
             if thread_id:
                 thread_key = f"{chat_id}:{thread_id}"

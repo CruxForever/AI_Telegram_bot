@@ -545,7 +545,8 @@ def _process_one(update_raw: str) -> str:
     if has_image and not (text or "").strip():
         stored_text = "[изображение]"
 
-    dkey = dialog_key_for(chat_type, chat_id, user_id, thread_id, parsed.get("is_topic", False))
+    is_topic = bool(parsed.get("is_topic"))
+    dkey = dialog_key_for(chat_type, chat_id, user_id, thread_id, is_topic)
     logger.info("ctx dkey=%s chat=%s/%s msg=%s", dkey, chat_type, chat_id, msg_id)
 
     try:
@@ -565,7 +566,10 @@ def _process_one(update_raw: str) -> str:
                     update_user_names(str(user_id), username, first_name, last_name)
         if chat_type != "private":
             if not get_channel(str(chat_id)): save_channel(str(chat_id), None)
-            if thread_id:
+            # Запись треда заводим только для настоящих форум-топиков — тех, по которым мы
+            # реально ведём отдельную историю (см. dialog_key_for). Для комментариев под
+            # постами канала это был чистый мусор: 913 записей в Threads на ровном месте.
+            if thread_id and is_topic:
                 thread_key = f"{chat_id}:{thread_id}"
                 if not get_thread(thread_key): save_thread(thread_key, "")
         logger.info("STEP1 ensured entities")
